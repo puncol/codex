@@ -28,6 +28,7 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -506,6 +507,70 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
     Ok(())
 }
 
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+/// Scenario: automatic compaction runs inside a user turn, then that completed turn is rolled
+/// back. The next request must rebuild the raw pre-turn history instead of retaining the discarded
+/// compaction checkpoint.
+async fn rollback_turn_with_auto_compaction_restores_pre_turn_history() -> Result<()> {
+    if network_disabled() {
+        println!("Skipping test because network is disabled in this sandbox");
+        return Ok(());
+    }
+
+    const PRE_TURN: &str = "PRE_TURN";
+    const PRE_TURN_REPLY: &str = "PRE_TURN_REPLY";
+    const ROLLED_BACK_TURN: &str = "ROLLED_BACK_TURN";
+    const ROLLED_BACK_REPLY: &str = "ROLLED_BACK_REPLY";
+    const AUTO_SUMMARY: &str = "AUTO_SUMMARY";
+
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", PRE_TURN_REPLY),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 330_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", AUTO_SUMMARY),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", ROLLED_BACK_REPLY),
+                ev_completed("r3"),
+            ]),
+            sse(vec![ev_completed("r4")]),
+        ],
+    )
+    .await;
+
+    let (_home, _config, _manager, base) = start_auto_compact_test_conversation(&server).await;
+    user_turn(&base, PRE_TURN).await;
+    user_turn(&base, ROLLED_BACK_TURN).await;
+
+    base.submit(Op::ThreadRollback { num_turns: 1 })
+        .await
+        .expect("submit thread rollback");
+    wait_for_event(&base, |event| {
+        matches!(event, EventMsg::ThreadRolledBack(_))
+    })
+    .await;
+    user_turn(&base, AFTER_ROLLBACK).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[1].body_contains_text(SUMMARIZATION_PROMPT));
+    let after_rollback = &requests[3];
+    assert!(after_rollback.body_contains_text(PRE_TURN));
+    assert!(after_rollback.body_contains_text(PRE_TURN_REPLY));
+    assert!(!after_rollback.body_contains_text(ROLLED_BACK_TURN));
+    assert!(!after_rollback.body_contains_text(ROLLED_BACK_REPLY));
+    assert!(!after_rollback.body_contains_text(AUTO_SUMMARY));
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: rolling back a turn that introduced persistent pre-thread settings
 /// diffs should trim those context updates so the next request includes them
@@ -767,6 +832,22 @@ async fn start_test_conversation(
     let test = Box::pin(builder.build(server))
         .await
         .expect("create conversation");
+    (test.home, test.config, test.thread_manager, test.codex)
+}
+
+async fn start_auto_compact_test_conversation(
+    server: &MockServer,
+) -> (Arc<TempDir>, Config, Arc<ThreadManager>, Arc<CodexThread>) {
+    let base_url = format!("{}/v1", server.uri());
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider.name = "Non-OpenAI Model provider".to_string();
+        config.model_provider.base_url = Some(base_url);
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let test = Box::pin(builder.build(server))
+        .await
+        .expect("create auto-compact conversation");
     (test.home, test.config, test.thread_manager, test.codex)
 }
 
