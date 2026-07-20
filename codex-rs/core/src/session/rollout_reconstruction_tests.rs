@@ -17,6 +17,7 @@ use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::PathBuf;
+use test_case::test_case;
 use uuid::Uuid;
 
 fn user_message(text: &str) -> ResponseItem {
@@ -901,17 +902,26 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
     assert!(session.reference_context_item().await.is_none());
 }
 
+#[test_case(false; "incomplete turn")]
+#[test_case(true; "completed turn")]
 #[tokio::test]
-async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_compaction_metadata() {
+async fn record_initial_history_resumed_rollback_drops_user_turn_compaction_metadata(
+    turn_completed: bool,
+) {
     let (session, turn_context) = make_session_and_context().await;
     let previous_context_item = turn_context.to_turn_context_item();
     let previous_turn_id = previous_context_item
         .turn_id
         .clone()
         .expect("turn context should have turn_id");
-    let incomplete_turn_id = "incomplete-compacted-user-turn".to_string();
+    let rolled_back_turn_id = "compacted-user-turn".to_string();
+    let previous_user = user_message("PRE_TURN_SENTINEL");
+    let previous_assistant = assistant_message("PRE_TURN_REPLY");
+    let rolled_back_user = user_message("ROLLED_BACK_SENTINEL");
+    let rolled_back_assistant = assistant_message("ROLLED_BACK_REPLY");
+    let expected_history = vec![previous_user.clone(), previous_assistant.clone()];
 
-    let rollout_items = vec![
+    let mut rollout_items = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
@@ -932,6 +942,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             },
         )),
         RolloutItem::TurnContext(previous_context_item.clone()),
+        RolloutItem::ResponseItem(previous_user.clone()),
+        RolloutItem::ResponseItem(previous_assistant.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
@@ -945,7 +957,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
-                turn_id: incomplete_turn_id,
+                turn_id: rolled_back_turn_id.clone(),
                 trace_id: None,
                 started_at: None,
                 model_context_window: Some(128_000),
@@ -962,18 +974,38 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
                 ..Default::default()
             },
         )),
+        RolloutItem::ResponseItem(rolled_back_user.clone()),
+        RolloutItem::ResponseItem(rolled_back_assistant.clone()),
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
-            replacement_history: Some(Vec::new()),
+            replacement_history: Some(vec![
+                previous_user,
+                previous_assistant,
+                rolled_back_user,
+                rolled_back_assistant,
+            ]),
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
         }),
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-        )),
     ];
+    if turn_completed {
+        rollout_items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: rolled_back_turn_id,
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            },
+        )));
+    }
+    rollout_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -983,6 +1015,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         }))
         .await;
 
+    assert_eq!(session.clone_history().await.raw_items(), expected_history);
     assert_eq!(
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
